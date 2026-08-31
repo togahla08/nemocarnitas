@@ -66,8 +66,7 @@ CREATE TABLE ventas (
   numero_venta SERIAL UNIQUE NOT NULL,
   fecha TIMESTAMPTZ DEFAULT NOW(),
   usuario_id UUID REFERENCES usuarios(id),
-  total DECIMAL(12,2) GENERATED ALWAYS AS SUM -- se calculará en trigger
-       STORED, -- se calcula automáticamente
+  total DECIMAL(12,2) NOT NULL DEFAULT 0,
   tipo_pago VARCHAR(20) NOT NULL CHECK (tipo_pago IN ('efectivo', 'tarjeta', 'transferencia')),
   estado VARCHAR(20) NOT NULL DEFAULT 'completado' CHECK (estado IN ('completado', 'cancelado')),
   creado_en TIMESTAMPTZ DEFAULT NOW(),
@@ -120,9 +119,14 @@ CREATE TRIGGER trigger_actualizar_stock_venta
 -- Trigger para registrar movimiento de inventario
 CREATE OR REPLACE FUNCTION registrar_movimiento_inventario_venta()
 RETURNS TRIGGER AS $$
+DECLARE
+  v_usuario_id UUID;
 BEGIN
+  -- Obtener usuario_id de la venta padre
+  SELECT usuario_id INTO v_usuario_id FROM ventas WHERE id = NEW.venta_id;
+  
   INSERT INTO movimientos_inventario (producto_id, tipo, cantidad, fecha, usuario_id, referencia_tipo, referencia_id)
-  VALUES ('NEW'.producto_id, 'salida', NEW.cantidad, NOW(), 'NEW'.usuario_id, 'venta', NEW.id);
+  VALUES (NEW.producto_id, 'salida', NEW.cantidad, NOW(), v_usuario_id, 'venta', NEW.venta_id);
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -164,7 +168,7 @@ CREATE TABLE pedidos (
   cliente_nombre VARCHAR(100) NOT NULL,
   tipo_pedido VARCHAR(20) NOT NULL DEFAULT 'mostrar' CHECK (tipo_pedido IN ('mostrar', 'para_llevar', 'delivery')),
   estado VARCHAR(20) NOT NULL DEFAULT 'pendiente' CHECK (estado IN ('pendiente', 'preparando', 'listo', 'entregado')),
-  total DECIMAL(12,2) GENERATED ALWAYS AS SUM STORED,
+  total DECIMAL(12,2) NOT NULL DEFAULT 0,
   usuario_id UUID REFERENCES usuarios(id),
   creado_en TIMESTAMPTZ DEFAULT NOW(),
   actualizado_en TIMESTAMPTZ DEFAULT NOW()
@@ -202,12 +206,12 @@ CREATE TABLE pedidos_items (
 CREATE TABLE movimientos_inventario (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   producto_id UUID REFERENCES productos(id),
-  tipo VARCHAR(20) NOT NULL CHECK (tipo ENTRADA, SALIDA),
+  tipo VARCHAR(20) NOT NULL CHECK (tipo IN ('ENTRADA', 'SALIDA')),
   cantidad INTEGER NOT NULL,
   fecha TIMESTAMPTZ DEFAULT NOW(),
   usuario_id UUID REFERENCES usuarios(id),
-  referencia_tipo VARCHAR(50), -- 'venta', 'pedido', 'gasto', etc.
-  referencia_id UUID, -- ID de la venta, pedido o gasto relacionado
+  referencia_tipo VARCHAR(50),
+  referencia_id UUID,
   creado_en TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -224,19 +228,6 @@ CREATE TABLE control_caja (
   creado_en TIMESTAMPTZ DEFAULT NOW(),
   actualizado_en TIMESTAMPTZ DEFAULT NOW()
 );
-
--- Trigger para actualizar control_caja automáticamente
-CREATE OR REPLACE FUNCTION actualizar_control_caja()
-RETURNS TRIGGER AS $$
-BEGIN
-  -- Este trigger se ejecuta al insertar/actualizar una venta o gasto
-  -- La recalculación se maneja mediante views y consultas periodicas
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Crear control_caja por fecha (usando trigger on commit)
--- Se insertará manualmente o mediante proceso de conciliación
 
 -- ============================================================
 -- TABLA 10: auditoria
@@ -257,11 +248,11 @@ RETURNS TRIGGER AS $$
 BEGIN
   INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
   VALUES (
-    COALESCE(NEW.usuario_id, CURRENT_USER::uuid),
+    NEW.id,
     'usuarios',
     TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN ROW_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP = 'UPDATE' THEN ROW_to_json(NEW) ELSE NULL END,
+    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
+    CASE WHEN TG_OP = 'UPDATE' THEN row_to_json(NEW) ELSE NULL END,
     NOW()
   );
   RETURN NEW;
@@ -278,11 +269,11 @@ RETURNS TRIGGER AS $$
 BEGIN
   INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
   VALUES (
-    COALESCE(NEW.usuario_id, CURRENT_USER::uuid),
+    NEW.id,
     'productos',
     TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN ROW_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP = 'UPDATE' THEN ROW_to_json(NEW) ELSE NULL END,
+    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
+    CASE WHEN TG_OP = 'UPDATE' THEN row_to_json(NEW) ELSE NULL END,
     NOW()
   );
   RETURN NEW;
@@ -299,11 +290,11 @@ RETURNS TRIGGER AS $$
 BEGIN
   INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
   VALUES (
-    COALESCE(NEW.usuario_id, CURRENT_USER::uuid),
+    NEW.usuario_id,
     'ventas',
     TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN ROW_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN ROW_to_json(NEW) ELSE NULL END,
+    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
+    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW) ELSE NULL END,
     NOW()
   );
   RETURN NEW;
@@ -314,17 +305,38 @@ CREATE TRIGGER trigger_auditar_ventas
   AFTER INSERT OR UPDATE OR DELETE ON ventas
   FOR EACH ROW EXECUTE FUNCTION trigger_auditar_ventas();
 
+-- Trigger de auditoría para gastos table
+CREATE OR REPLACE FUNCTION trigger_auditar_gastos()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
+  VALUES (
+    NEW.usuario_id,
+    'gastos',
+    TG_OP,
+    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
+    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW) ELSE NULL END,
+    NOW()
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_auditar_gastos
+  AFTER INSERT OR UPDATE OR DELETE ON gastos
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar_gastos();
+
 -- Trigger de auditoría para pedidos table
 CREATE OR REPLACE FUNCTION trigger_auditar_pedidos()
 RETURNS TRIGGER AS $$
 BEGIN
   INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
   VALUES (
-    COALESCE(NEW.usuario_id, CURRENT_USER::uuid),
+    NEW.usuario_id,
     'pedidos',
     TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN ROW_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN ROW_to_json(NEW) ELSE NULL END,
+    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
+    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW) ELSE NULL END,
     NOW()
   );
   RETURN NEW;
@@ -430,65 +442,6 @@ ALTER TABLE movimientos_inventario ENABLE ROW LEVEL SECURITY;
 ALTER TABLE control_caja ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auditoria ENABLE ROW LEVEL SECURITY;
 
--- POLÍTICAS USUARIOS
--- Admin ve todo, otros solo ven su propio registro
-CREATE POLICY policy_usuarios_admin ON usuarios
-  FOR ALL TO admin USING (true) WITH CHECK (true);
-
-CREATE POLICY policy_usuarios_propios ON usuarios
-  FOR SELECT TO socio, toma_pedidos USING (email = current_user_email());
-
--- POLÍTICOS PRODUCTOS
--- Admin y socio ven todos, toma_pedidos solo ver activos
-CREATE POLICY policy_productos_admin ON productos FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_productos_socio ON productos FOR ALL TO socio USING (true);
-CREATE POLICY policy_productos_toma_pedidos ON productos FOR SELECT TO toma_pedidos USING (activo = true);
-
--- POLÍTICAS VENTAS
--- Admin ve todo, socio solo sus ventas, toma_pedidos no ve ventas
-CREATE POLICY policy_ventas_admin ON ventas FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_ventas_socio ON ventas FOR SELECT TO socio USING (usuario_id = auth.uid());
-CREATE POLICY policy_ventas_toma_pedidos ON ventas FOR SELECT TO toma_pedidos USING (false);
-
--- POLÍTICAS VENTAS_ITEMS
-CREATE POLICY policy_ventas_items_admin ON ventas_items FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_ventas_items_socio ON ventas_items FOR SELECT TO socio USING (venta_id IN (SELECT id FROM ventas WHERE usuario_id = auth.uid()));
-CREATE POLICY policy_ventas_items_toma_pedidos ON ventas_items FOR SELECT TO toma_pedidos USING (false);
-
--- POLÍTICAS GASTOS
--- Admin todo, socio solo crear los suyos, no editar/eliminar los de otros
-CREATE POLICY policy_gastos_admin ON gastos FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_gastos_socio_create ON gastos FOR SELECT TO socio USING (usuario_id = auth.uid());
-CREATE POLICY policy_gastos_socio_insert ON gastos FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid());
--- Socio no puede editar/eliminar gastos de otros
-CREATE POLICY policy_gastos_socio_no_editar ON gastos FOR UPDATE TO socio USING (usuario_id = auth.uid());
-CREATE POLICY policy_gastos_socio_no_eliminar ON gastos FOR DELETE TO socio USING (false);
-
--- POLÍTICAS PEDIDOS
--- Admin todo, socio sus pedidos, toma_pedidos puede crear y ver realtime
-CREATE POLICY policy_pedidos_admin ON pedidos FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_pedidos_socio ON pedidos FOR SELECT TO socio USING (usuario_id = auth.uid());
-CREATE POLICY policy_pedidos_toma_pedidos_insert ON pedidos FOR INSERT TO toma_pedidos WITH CHECK (true);
-CREATE POLICY policy_pedidos_toma_pedidos_select ON pedidos FOR SELECT TO toma_pedidos USING (true);
-
--- POLÍTICAS PEDIDOS_ITEMS
-CREATE POLICY policy_pedidos_items_admin ON pedidos_items FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_pedidos_items_socio ON pedidos_items FOR SELECT TO socio USING (pedido_id IN (SELECT id FROM pedidos WHERE usuario_id = auth.uid()));
-CREATE POLICY policy_pedidos_items_toma_pedidos ON pedidos_items FOR SELECT TO toma_pedidos USING (true);
-
--- POLÍTICAS MOVIMIENTOS_INVENTARIO
-CREATE POLICY policy_movimientos_admin ON movimientos_inventario FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_movimientos_lectura ON movimientos_inventario FOR SELECT TO socio, toma_pedidos USING (true);
-
--- POLÍTICAS CONTROL_CAJA
-CREATE POLICY policy_control_caja_admin ON control_caja FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_control_caja_select ON control_caja FOR SELECT TO socio, toma_pedidos USING (true);
-
--- POLÍTICAS AUDITORÍA
--- Solo admin puede ver auditoría completa
-CREATE POLICY policy_auditor_admin ON auditoria FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_auditor_lectura ON auditoria FOR SELECT TO socio, toma_pedidos USING (false);
-
 -- Función auxiliar para obtener email actual del usuario
 CREATE OR REPLACE FUNCTION current_user_email() RETURNS TEXT AS $$
 DECLARE
@@ -500,37 +453,74 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- DATOS ADICIONALES Y CONFIGURACIÓN
+-- Políticas de Seguridad por Rol
 -- ============================================================
 
--- Permisos por defecto para roles (usar con application.jwt.claims)
--- Admin: bypass RLS
--- Socio: solo sus datos
--- Toma_Pedidos: limited access
+-- Políticas USUARIOS
+CREATE POLICY policy_usuarios_admin ON usuarios
+  FOR ALL TO admin USING (true) WITH CHECK (true);
 
--- Índices para performance
+CREATE POLICY policy_usuarios_propios ON usuarios
+  FOR SELECT TO socio, toma_pedidos USING (email = current_user_email());
+
+-- Políticas PRODUCTOS  
+CREATE POLICY policy_productos_admin ON productos FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_productos_socio ON productos FOR ALL TO socio USING (true);
+CREATE POLICY policy_productos_toma_pedidos ON productos FOR SELECT TO toma_pedidos USING (activo = true);
+
+-- Políticas VENTAS
+CREATE POLICY policy_ventas_admin ON ventas FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_ventas_socio ON ventas FOR SELECT TO socio USING (usuario_id = auth.uid());
+CREATE POLICY policy_ventas_socio_insert ON ventas FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid());
+CREATE POLICY policy_ventas_toma_pedidos ON ventas FOR SELECT TO toma_pedidos USING (false);
+
+-- Políticas VENTAS_ITEMS
+CREATE POLICY policy_ventas_items_admin ON ventas_items FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_ventas_items_socio ON ventas_items FOR SELECT TO socio USING (venta_id IN (SELECT id FROM ventas WHERE usuario_id = auth.uid()));
+CREATE POLICY policy_ventas_items_socio_insert ON ventas_items FOR INSERT TO socio WITH CHECK (true);
+CREATE POLICY policy_ventas_items_toma_pedidos ON ventas_items FOR SELECT TO toma_pedidos USING (false);
+
+-- Políticas GASTOS
+CREATE POLICY policy_gastos_admin ON gastos FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_gastos_socio_select ON gastos FOR SELECT TO socio USING (usuario_id = auth.uid());
+CREATE POLICY policy_gastos_socio_insert ON gastos FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid());
+CREATE POLICY policy_gastos_socio_no_editar ON gastos FOR UPDATE TO socio USING (false);
+CREATE POLICY policy_gastos_socio_no_eliminar ON gastos FOR DELETE TO socio USING (false);
+CREATE POLICY policy_gastos_toma_pedidos ON gastos FOR SELECT TO toma_pedidos USING (false);
+
+-- Políticas PEDIDOS
+CREATE POLICY policy_pedidos_admin ON pedidos FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_pedidos_socio ON pedidos FOR SELECT TO socio USING (usuario_id = auth.uid());
+CREATE POLICY policy_pedidos_toma_pedidos ON pedidos FOR SELECT TO toma_pedidos USING (true);
+CREATE POLICY policy_pedidos_toma_pedidos_insert ON pedidos FOR INSERT TO toma_pedidos WITH CHECK (true);
+
+-- Políticas PEDIDOS_ITEMS
+CREATE POLICY policy_pedidos_items_admin ON pedidos_items FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_pedidos_items_socio ON pedidos_items FOR SELECT TO socio USING (pedido_id IN (SELECT id FROM pedidos WHERE usuario_id = auth.uid()));
+CREATE POLICY policy_pedidos_items_toma_pedidos ON pedidos_items FOR SELECT TO toma_pedidos USING (true);
+
+-- Políticas MOVIMIENTOS_INVENTARIO
+CREATE POLICY policy_movimientos_admin ON movimientos_inventario FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_movimientos_lectura ON movimientos_inventario FOR SELECT TO socio, toma_pedidos USING (true);
+
+-- Políticas CONTROL_CAJA
+CREATE POLICY policy_control_caja_admin ON control_caja FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_control_caja_select ON control_caja FOR SELECT TO socio, toma_pedidos USING (true);
+
+-- Políticas AUDITORÍA
+CREATE POLICY policy_auditor_admin ON auditoria FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_auditor_lectura ON auditoria FOR SELECT TO socio, toma_pedidos USING (false);
+
+-- ============================================================
+-- Índices para Performance
+-- ============================================================
 CREATE INDEX idx_ventas_fecha ON ventas(fecha DESC);
 CREATE INDEX idx_ventas_usuario ON ventas(usuario_id);
 CREATE INDEX idx_productos_categoria ON productos(categoria);
+CREATE INDEX idx_productos_stock ON productos(stock);
 CREATE INDEX idx_gastos_fecha ON gastos(fecha);
 CREATE INDEX idx_pedidos_fecha ON pedidos(fecha DESC);
 CREATE INDEX idx_movimientos_producto ON movimientos_inventario(producto_id);
 CREATE INDEX idx_auditoria_fecha ON auditoria(fecha DESC);
 CREATE INDEX idx_ventas_items_producto ON ventas_items(producto_id);
 CREATE INDEX idx_pedidos_items_producto ON pedidos_items(producto_id);
-
--- Comentarios del sistema
-COMMENT ON TABLE usuarios IS 'Usuarios del sistema La Barrita de Carnitas';
-COMMENT ON TABLE productos IS 'Productos disponibles (carnitas, órdenes, bebidas)';
-COMMENT ON TABLE ventas IS 'Historial de ventas completadas';
-COMMENT ON TABLE ventas_items 'Items de cada venta';
-COMMENT ON TABLE gastos 'Gastos categorizados del negocio';
-COMMENT ON TABLE pedidos 'Pedidos de clientes (mostrar/para_llevar/delivery)';
-COMMENT ON TABLE pedidos_items 'Items de cada pedido';
-COMMENT ON TABLE movimientos_inventario 'Movimientos de stock (entradas/salidas)';
-COMMENT ON TABLE control_caja 'Control de caja diaria';
-COMMENT ON TABLE auditoria 'Log de todos los cambios del sistema';
-
--- ============================================================
--- FIN DEL SCHEMA
--- ============================================================
