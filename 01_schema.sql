@@ -308,6 +308,10 @@ CREATE TRIGGER trigger_auditar_control_caja
   AFTER INSERT OR UPDATE OR DELETE ON control_caja
   FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
 
+CREATE TRIGGER trigger_auditar_auditoria
+  AFTER INSERT OR UPDATE OR DELETE ON auditoria
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
+
 -- ============================================================
 -- VISTAS ANALÍTICAS
 -- ============================================================
@@ -373,7 +377,7 @@ GROUP BY p.id, p.numero_pedido, p.cliente_nombre, p.tipo_pedido, p.estado, p.fec
 ORDER BY p.fecha DESC;
 
 -- ============================================================
--- POLÍTICAS RLS - Cada tabla necesita su propia política
+-- POLÍTICAS RLS - Usar rol de usuarios table
 -- ============================================================
 ALTER TABLE usuarios ENABLE ROW LEVEL SECURITY;
 ALTER TABLE productos ENABLE ROW LEVEL SECURITY;
@@ -386,38 +390,88 @@ ALTER TABLE movimientos_inventario ENABLE ROW LEVEL SECURITY;
 ALTER TABLE control_caja ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auditoria ENABLE ROW LEVEL SECURITY;
 
--- Política Admin - Acceso total a todo
-CREATE POLICY policy_admin_usuarios ON usuarios FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_productos ON productos FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_ventas ON ventas FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_ventas_items ON ventas_items FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_gastos ON gastos FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_pedidos ON pedidos FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_pedidos_items ON pedidos_items FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_movimientos ON movimientos_inventario FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_control_caja ON control_caja FOR ALL USING (superuser()).
-CREATE POLICY policy_admin_auditoria ON auditoria FOR ALL USING (superuser());
+-- Rolada de función auxiliar (opcional, para verificar rol)
+CREATE OR REPLACE FUNCTION es_admin() RETURNS BOOLEAN AS $$
+  SELECT EXISTS(SELECT 1 FROM usuarios WHERE id = auth.uid() AND rol = 'admin')
+$$ LANGUAGE sql STABLE;
 
--- Políticas Socio
-CREATE POLICY policy_socio_ventas ON ventas FOR SELECT TO socio USING (usuario_id = auth.uid()).
-CREATE POLICY policy_socio_ventas_insert ON ventas FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid()).
-CREATE POLICY policy_socio_ventas_items ON ventas_items FOR SELECT TO socio USING (true).
-CREATE POLICY policy_socio_gastos ON gastos FOR SELECT TO socio USING (usuario_id = auth.uid()).
-CREATE POLICY policy_socio_gastos_insert ON gastos FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid()).
-CREATE POLICY policy_socio_gastos_update ON gastos FOR UPDATE TO socio USING (false).
-CREATE POLICY policy_socio_gastos_delete ON gastos FOR DELETE TO socio USING (false).
-CREATE POLICY policy_socio_pedidos ON pedidos FOR SELECT TO socio USING (usuario_id = auth.uid()).
-CREATE POLICY policy_socio_productos ON productos FOR ALL TO socio USING (true).
-CREATE POLICY policy_socio_movimientos ON movimientos_inventario FOR SELECT TO socio USING (true).
+-- ============================================================
+-- Políticas USUARIOS
+-- ============================================================
+CREATE POLICY policy_usuarios_admin ON usuarios
+  FOR ALL TO admin USING (true) WITH CHECK (true);
 
--- Políticas Toma Pedidos
-CREATE POLICY policy_pedidos_toma ON pedidos FOR SELECT TO toma_pedidos USING (true).
-CREATE POLICY policy_pedidos_insert_toma ON pedidos FOR INSERT TO toma_pedidos WITH CHECK (true).
-CREATE POLICY policy_productos_toma ON productos FOR SELECT TO toma_pedidos USING (activo = true).
-CREATE POLICY policy_movimientos_toma ON movimientos_inventario FOR SELECT TO toma_pedidos USING (true).
+CREATE POLICY policy_usuarios_propios ON usuarios
+  FOR SELECT TO socio, toma_pedidos USING (email = (SELECT email FROM usuarios WHERE id = auth.uid()));
 
--- Política de auditoría - Solo admin ve auditoría
-CREATE POLICY policy_auditoria_admin ON auditoria FOR SELECT USING (superuser()).
+-- ============================================================
+-- Políticas PRODUCTOS
+-- ============================================================
+CREATE POLICY policy_productos_admin ON productos FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_productos_socio ON productos FOR ALL TO socio USING (true);
+CREATE POLICY policy_productos_toma_pedidos ON productos FOR SELECT TO toma_pedidos USING (activo = true);
+
+-- ============================================================
+-- Políticas VENTAS
+-- ============================================================
+CREATE POLICY policy_ventas_admin ON ventas FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_ventas_socio ON ventas FOR SELECT TO socio USING (usuario_id = auth.uid());
+CREATE POLICY policy_ventas_socio_insert ON ventas FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid());
+CREATE POLICY policy_ventas_toma_pedidos ON ventas FOR SELECT TO toma_pedidos USING (false);
+
+-- ============================================================
+-- Políticas VENTAS_ITEMS
+-- ============================================================
+CREATE POLICY policy_ventas_items_admin ON ventas_items FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_ventas_items_socio ON ventas_items FOR SELECT TO socio USING (
+  venta_id IN (SELECT id FROM ventas WHERE usuario_id = auth.uid())
+);
+CREATE POLICY policy_ventas_items_toma_pedidos ON ventas_items FOR SELECT TO toma_pedidos USING (false);
+
+-- ============================================================
+-- Políticas GASTOS
+-- ============================================================
+CREATE POLICY policy_gastos_admin ON gastos FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_gastos_socio_select ON gastos FOR SELECT TO socio USING (usuario_id = auth.uid());
+CREATE POLICY policy_gastos_socio_insert ON gastos FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid());
+CREATE POLICY policy_gastos_socio_update ON gastos FOR UPDATE TO socio USING (false);
+CREATE POLICY policy_gastos_socio_delete ON gastos FOR DELETE TO socio USING (false);
+CREATE POLICY policy_gastos_toma_pedidos ON gastos FOR SELECT TO toma_pedidos USING (false);
+
+-- ============================================================
+-- Políticas PEDIDOS
+-- ============================================================
+CREATE POLICY policy_pedidos_admin ON pedidos FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_pedidos_socio ON pedidos FOR SELECT TO socio USING (usuario_id = auth.uid());
+CREATE POLICY policy_pedidos_toma_pedidos_select ON pedidos FOR SELECT TO toma_pedidos USING (true);
+CREATE POLICY policy_pedidos_toma_pedidos_insert ON pedidos FOR INSERT TO toma_pedidos WITH CHECK (true);
+
+-- ============================================================
+-- Políticas PEDIDOS_ITEMS
+-- ============================================================
+CREATE POLICY policy_pedidos_items_admin ON pedidos_items FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_pedidos_items_socio ON pedidos_items FOR SELECT TO socio USING (
+  pedido_id IN (SELECT id FROM pedidos WHERE usuario_id = auth.uid())
+);
+CREATE POLICY policy_pedidos_items_toma_pedidos ON pedidos_items FOR SELECT TO toma_pedidos USING (true);
+
+-- ============================================================
+-- Políticas MOVIMIENTOS_INVENTARIO
+-- ============================================================
+CREATE POLICY policy_movimientos_admin ON movimientos_inventario FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_movimientos_lectura ON movimientos_inventario FOR SELECT TO socio, toma_pedidos USING (true);
+
+-- ============================================================
+-- Políticas CONTROL_CAJA
+-- ============================================================
+CREATE POLICY policy_control_caja_admin ON control_caja FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_control_caja_select ON control_caja FOR SELECT TO socio, toma_pedidos USING (true);
+
+-- ============================================================
+-- Políticas AUDITORÍA
+-- ============================================================
+CREATE POLICY policy_auditoria_admin ON auditoria FOR ALL TO admin USING (true) WITH CHECK (true);
+CREATE POLICY policy_auditoria_lectura ON auditoria FOR SELECT TO socio, toma_pedidos USING (false);
 
 -- ============================================================
 -- ÍNDICES
@@ -429,3 +483,4 @@ CREATE INDEX idx_gastos_fecha ON gastos(fecha);
 CREATE INDEX idx_pedidos_fecha ON pedidos(fecha DESC);
 CREATE INDEX idx_movimientos_producto ON movimientos_inventario(producto_id);
 CREATE INDEX idx_auditoria_fecha ON auditoria(fecha DESC);
+CREATE INDEX idx_usuarios_rol ON usuarios(rol);
