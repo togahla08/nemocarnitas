@@ -77,15 +77,13 @@ CREATE TABLE ventas (
 CREATE OR REPLACE FUNCTION calcular_venta_total()
 RETURNS TRIGGER AS $$
 BEGIN
-  -- El total se calcula automáticamente en ventas_items
-  -- Este trigger asegura que total se actualice si cambia algún item
-  NEW.total = (SELECT COALESCE(SUM(subtotal), 0) FROM ventas_items WHERE venta_id = NEW.id);
+  NEW.total = (SELECT COALESCE(SUM(subtotal), 0) FROM ventas_items WHERE venta_id = NEW.venta_id);
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trigger_calcular_venta_total
-  AFTER INSERT OR UPDATE ON ventas_items
+  AFTER INSERT ON ventas_items
   FOR EACH ROW EXECUTE FUNCTION calcular_venta_total();
 
 -- ============================================================
@@ -105,7 +103,6 @@ CREATE TABLE ventas_items (
 CREATE OR REPLACE FUNCTION actualizar_stock_venta()
 RETURNS TRIGGER AS $$
 BEGIN
-  -- Descontar stock por cada item vendido
   UPDATE productos SET stock = stock - NEW.cantidad
   WHERE id = NEW.producto_id;
   RETURN NEW;
@@ -122,9 +119,7 @@ RETURNS TRIGGER AS $$
 DECLARE
   v_usuario_id UUID;
 BEGIN
-  -- Obtener usuario_id de la venta padre
   SELECT usuario_id INTO v_usuario_id FROM ventas WHERE id = NEW.venta_id;
-  
   INSERT INTO movimientos_inventario (producto_id, tipo, cantidad, fecha, usuario_id, referencia_tipo, referencia_id)
   VALUES (NEW.producto_id, 'salida', NEW.cantidad, NOW(), v_usuario_id, 'venta', NEW.venta_id);
   RETURN NEW;
@@ -178,13 +173,13 @@ CREATE TABLE pedidos (
 CREATE OR REPLACE FUNCTION calcular_pedido_total()
 RETURNS TRIGGER AS $$
 BEGIN
-  NEW.total = (SELECT COALESCE(SUM(subtotal), 0) FROM pedidos_items WHERE pedido_id = NEW.id);
+  NEW.total = (SELECT COALESCE(SUM(subtotal), 0) FROM pedidos_items WHERE pedido_id = NEW.pedido_id);
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trigger_calcular_pedido_total
-  AFTER INSERT OR UPDATE ON pedidos_items
+  AFTER INSERT ON pedidos_items
   FOR EACH ROW EXECUTE FUNCTION calcular_pedido_total();
 
 -- ============================================================
@@ -222,12 +217,30 @@ CREATE TABLE control_caja (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   fecha DATE UNIQUE NOT NULL,
   saldo_inicial DECIMAL(12,2) NOT NULL DEFAULT 0,
-  total_ventas DECIMAL(12,2) GENERATED ALWAYS AS (SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha::date = control_caja.fecha) STORED,
-  total_gastos DECIMAL(12,2) GENERATED ALWAYS AS (SELECT COALESCE(SUM(cantidad), 0) FROM gastos WHERE fecha::date = control_caja.fecha) STORED,
+  total_ventas DECIMAL(12,2) NOT NULL DEFAULT 0,
+  total_gastos DECIMAL(12,2) NOT NULL DEFAULT 0,
   efectivo_real DECIMAL(12,2),
   creado_en TIMESTAMPTZ DEFAULT NOW(),
   actualizado_en TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Trigger para calcular totales de caja
+CREATE OR REPLACE FUNCTION actualizar_control_caja()
+RETURNS TRIGGER AS $$
+BEGIN
+  SELECT COALESCE(SUM(total), 0) INTO NEW.total_ventas
+  FROM ventas WHERE fecha::date = NEW.fecha;
+  
+  SELECT COALESCE(SUM(cantidad), 0) INTO NEW.total_gastos
+  FROM gastos WHERE fecha::date = NEW.fecha;
+  
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_actualizar_control_caja
+  BEFORE INSERT OR UPDATE ON control_caja
+  FOR EACH ROW EXECUTE FUNCTION actualizar_control_caja();
 
 -- ============================================================
 -- TABLA 10: auditoria
@@ -242,17 +255,17 @@ CREATE TABLE auditoria (
   fecha TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Trigger de auditoría para usuarios table
-CREATE OR REPLACE FUNCTION trigger_auditar_usuarios()
+-- Trigger de auditoría
+CREATE OR REPLACE FUNCTION trigger_auditar()
 RETURNS TRIGGER AS $$
 BEGIN
   INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
   VALUES (
-    NEW.id,
-    'usuarios',
+    auth.uid(),
+    TG_TABLE_NAME,
     TG_OP,
     CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP = 'UPDATE' THEN row_to_json(NEW) ELSE NULL END,
+    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW) ELSE NULL END,
     NOW()
   );
   RETURN NEW;
@@ -261,176 +274,99 @@ $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trigger_auditar_usuarios
   AFTER INSERT OR UPDATE OR DELETE ON usuarios
-  FOR EACH ROW EXECUTE FUNCTION trigger_auditar_usuarios();
-
--- Trigger de auditoría para productos table
-CREATE OR REPLACE FUNCTION trigger_auditar_productos()
-RETURNS TRIGGER AS $$
-BEGIN
-  INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
-  VALUES (
-    NEW.id,
-    'productos',
-    TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP = 'UPDATE' THEN row_to_json(NEW) ELSE NULL END,
-    NOW()
-  );
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
 
 CREATE TRIGGER trigger_auditar_productos
   AFTER INSERT OR UPDATE OR DELETE ON productos
-  FOR EACH ROW EXECUTE FUNCTION trigger_auditar_productos();
-
--- Trigger de auditoría para ventas table
-CREATE OR REPLACE FUNCTION trigger_auditar_ventas()
-RETURNS TRIGGER AS $$
-BEGIN
-  INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
-  VALUES (
-    NEW.usuario_id,
-    'ventas',
-    TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW) ELSE NULL END,
-    NOW()
-  );
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
 
 CREATE TRIGGER trigger_auditar_ventas
   AFTER INSERT OR UPDATE OR DELETE ON ventas
-  FOR EACH ROW EXECUTE FUNCTION trigger_auditar_ventas();
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
 
--- Trigger de auditoría para gastos table
-CREATE OR REPLACE FUNCTION trigger_auditar_gastos()
-RETURNS TRIGGER AS $$
-BEGIN
-  INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
-  VALUES (
-    NEW.usuario_id,
-    'gastos',
-    TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW) ELSE NULL END,
-    NOW()
-  );
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+CREATE TRIGGER trigger_auditar_ventas_items
+  AFTER INSERT OR UPDATE OR DELETE ON ventas_items
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
 
 CREATE TRIGGER trigger_auditar_gastos
   AFTER INSERT OR UPDATE OR DELETE ON gastos
-  FOR EACH ROW EXECUTE FUNCTION trigger_auditar_gastos();
-
--- Trigger de auditoría para pedidos table
-CREATE OR REPLACE FUNCTION trigger_auditar_pedidos()
-RETURNS TRIGGER AS $$
-BEGIN
-  INSERT INTO auditoria (usuario_id, tabla, accion, valores_anteriores, valores_nuevos, fecha)
-  VALUES (
-    NEW.usuario_id,
-    'pedidos',
-    TG_OP,
-    CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
-    CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW) ELSE NULL END,
-    NOW()
-  );
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
 
 CREATE TRIGGER trigger_auditar_pedidos
   AFTER INSERT OR UPDATE OR DELETE ON pedidos
-  FOR EACH ROW EXECUTE FUNCTION trigger_auditar_pedidos();
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
+
+CREATE TRIGGER trigger_auditar_pedidos_items
+  AFTER INSERT OR UPDATE OR DELETE ON pedidos_items
+  FOR EACH ROW EXECUTE FUNCTION trigger_auditar();
 
 -- ============================================================
 -- 5 Vistas Analíticas
 -- ============================================================
 
--- Vista: Ventas diarias
-CREATE OR REPLACE VIEW vw_ventas_diarias AS
+CREATE VIEW vw_ventas_diarias AS
 SELECT 
-  DATE(ventas.fecha) AS fecha,
-  COUNT(ventas.id) AS total_ventas,
-  SUM(ventas.total) AS total_generado,
-  SUM(CASE WHEN ventas.tipo_pago = 'efectivo' THEN ventas.total ELSE 0 END) AS total_efectivo,
-  SUM(CASE WHEN ventas.tipo_pago = 'tarjeta' THEN ventas.total ELSE 0 END) AS total_tarjeta,
-  SUM(CASE WHEN ventas.tipo_pago = 'transferencia' THEN ventas.total ELSE 0 END) AS total_transferencia
+  DATE(fecha) AS fecha,
+  COUNT(*) AS total_ventas,
+  SUM(total) AS total_generado,
+  SUM(CASE WHEN tipo_pago = 'efectivo' THEN total ELSE 0 END) AS total_efectivo,
+  SUM(CASE WHEN tipo_pago = 'tarjeta' THEN total ELSE 0 END) AS total_tarjeta
 FROM ventas
-GROUP BY DATE(ventas.fecha)
-ORDER BY DATE(ventas.fecha) DESC;
+GROUP BY DATE(fecha)
+ORDER BY DATE(fecha) DESC;
 
--- Vista: Rotación de productos (ventas más frecuentes)
-CREATE OR REPLACE VIEW vw_productos_rotacion AS
+CREATE VIEW vw_productos_rotacion AS
 SELECT 
-  productos.nombre,
-  productos.categoria,
-  COALESCE(SUM(ventas_items.cantidad), 0) AS total_vendido,
-  COALESCE(SUM(ventas_items.subtotal), 0) AS ingreso_total,
-  productos.stock,
-  (productos.stock - COALESCE(SUM(ventas_items.cantidad), 0)) AS stock_restante
-FROM productos
-LEFT JOIN ventas_items ON productos.id = ventas_items.producto_id
-LEFT JOIN ventas ON ventas.id = ventas_items.venta_id
-GROUP BY productos.id, productos.nombre, productos.categoria, productos.stock
+  p.nombre,
+  p.categoria,
+  COALESCE(SUM(vi.cantidad), 0) AS total_vendido,
+  COALESCE(SUM(vi.subtotal), 0) AS ingreso_total,
+  p.stock
+FROM productos p
+LEFT JOIN ventas_items vi ON p.id = vi.producto_id
+GROUP BY p.id, p.nombre, p.categoria, p.stock
 ORDER BY total_vendido DESC;
 
--- Vista: Rentabilidad por producto
-CREATE OR REPLACE VIEW vw_rentabilidad_producto AS
+CREATE VIEW vw_rentabilidad AS
 SELECT 
-  productos.nombre,
-  productos.categoria,
-  COALESCE(SUM(ventas_items.cantidad), 0) AS unidades_vendidas,
-  COALESCE(SUM(ventas_items.subtotal), 0) AS ingreso_bruto,
-  COALESCE(SUM(ventas_items.cantidad * productos.costo_unitario), 0) AS costo_total,
-  COALESCE(SUM(ventas_items.subtotal), 0) - COALESCE(SUM(ventas_items.cantidad * productos.costo_unitario), 0) AS ganancia_neta,
-  ROUND(
-    (COALESCE(SUM(ventas_items.subtotal), 0) - COALESCE(SUM(ventas_items.cantidad * productos.costo_unitario), 0)) 
-    / NULLIF(COALESCE(SUM(ventas_items.subtotal), 0), 0) * 100, 
-    2
-  ) AS margen_porcentaje
-FROM productos
-LEFT JOIN ventas_items ON productos.id = ventas_items.producto_id
-GROUP BY productos.id, productos.nombre, productos.categoria
+  p.nombre,
+  p.categoria,
+  COALESCE(SUM(vi.cantidad), 0) AS unidades_vendidas,
+  COALESCE(SUM(vi.subtotal), 0) AS ingreso_bruto,
+  COALESCE(SUM(vi.cantidad * p.costo_unitario), 0) AS costo_total,
+  COALESCE(SUM(vi.subtotal), 0) - COALESCE(SUM(vi.cantidad * p.costo_unitario), 0) AS ganancia_neta
+FROM productos p
+LEFT JOIN ventas_items vi ON p.id = vi.producto_id
+GROUP BY p.id, p.nombre, p.categoria
 ORDER BY ganancia_neta DESC;
 
--- Vista: Resumen de gastos
-CREATE OR REPLACE VIEW vw_gastos_resumen AS
+CREATE VIEW vw_gastos_resumen AS
 SELECT 
-  DATE(gastos.fecha) AS fecha,
-  COUNT(gastos.id) AS total_gastos,
-  SUM(gastos.cantidad) AS total_cantidad,
-  GROUP_CONCAT(DISTINCT gastos.categoria) AS categorias,
-  MAX(gastos.estado) AS estado_general
+  DATE(fecha) AS fecha,
+  COUNT(*) AS total_gastos,
+  SUM(cantidad) AS total_cantidad,
+  STRING_AGG(DISTINCT categoria, ', ') AS categorias
 FROM gastos
-GROUP BY DATE(gastos.fecha)
-ORDER BY DATE(gastos.fecha) DESC;
+GROUP BY DATE(fecha)
+ORDER BY DATE(fecha) DESC;
 
--- Vista: Estado de pedidos
-CREATE OR REPLACE VIEW vw_estado_pedidos AS
+CREATE VIEW vw_estado_pedidos AS
 SELECT 
-  pedidos.id,
-  pedidos.numero_pedido,
-  pedidos.cliente_nombre,
-  pedidos.tipo_pedido,
-  pedidos.estado,
-  pedidos.fecha,
-  COALESCE(SUM(pedidos_items.subtotal), 0) AS total_pedido,
-  COUNT(pedidos_items.id) AS items_count
-FROM pedidos
-LEFT JOIN pedidos_items ON pedidos.id = pedidos_items.pedido_id
-GROUP BY pedidos.id, pedidos.numero_pedido, pedidos.cliente_nombre, pedidos.tipo_pedido, pedidos.estado, pedidos.fecha
-ORDER BY pedidos.fecha DESC;
+  p.id,
+  p.numero_pedido,
+  p.cliente_nombre,
+  p.tipo_pedido,
+  p.estado,
+  p.fecha,
+  COALESCE(SUM(pi.subtotal), 0) AS total_pedido
+FROM pedidos p
+LEFT JOIN pedidos_items pi ON p.id = pi.pedido_id
+GROUP BY p.id, p.numero_pedido, p.cliente_nombre, p.tipo_pedido, p.estado, p.fecha
+ORDER BY p.fecha DESC;
 
 -- ============================================================
--- POLÍTICAS RLS (Row Level Security)
+-- POLÍTICAS RLS
 -- ============================================================
-
--- Habilitar RLS en todas las tablas
 ALTER TABLE usuarios ENABLE ROW LEVEL SECURITY;
 ALTER TABLE productos ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ventas ENABLE ROW LEVEL SECURITY;
@@ -442,85 +378,30 @@ ALTER TABLE movimientos_inventario ENABLE ROW LEVEL SECURITY;
 ALTER TABLE control_caja ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auditoria ENABLE ROW LEVEL SECURITY;
 
--- Función auxiliar para obtener email actual del usuario
-CREATE OR REPLACE FUNCTION current_user_email() RETURNS TEXT AS $$
-DECLARE
-  user_email TEXT;
-BEGIN
-  SELECT email INTO user_email FROM usuarios WHERE id = auth.uid();
-  RETURN COALESCE(user_email, '');
-END;
-$$ LANGUAGE plpgsql;
+CREATE POLICY admin_all ON usuarios, productos, ventas, ventas_items, gastos, pedidos, pedidos_items, control_caja, auditoria
+  FOR ALL USING (current_user = 'admin');
+
+CREATE POLICY socio_ventas ON ventas, ventas_items
+  FOR SELECT USING (usuario_id = auth.uid());
+
+CREATE POLICY socio_gastos ON gastos
+  FOR SELECT USING (usuario_id = auth.uid())
+  FOR INSERT USING (true)
+  FOR UPDATE USING (false)
+  FOR DELETE USING (false);
+
+CREATE POLICY toma_pedidos_products ON productos
+  FOR SELECT USING (activo = true);
+
+CREATE POLICY toma_pedidos_pedidos ON pedidos
+  FOR SELECT USING (true)
+  FOR INSERT WITH CHECK (true);
 
 -- ============================================================
--- Políticas de Seguridad por Rol
--- ============================================================
-
--- Políticas USUARIOS
-CREATE POLICY policy_usuarios_admin ON usuarios
-  FOR ALL TO admin USING (true) WITH CHECK (true);
-
-CREATE POLICY policy_usuarios_propios ON usuarios
-  FOR SELECT TO socio, toma_pedidos USING (email = current_user_email());
-
--- Políticas PRODUCTOS  
-CREATE POLICY policy_productos_admin ON productos FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_productos_socio ON productos FOR ALL TO socio USING (true);
-CREATE POLICY policy_productos_toma_pedidos ON productos FOR SELECT TO toma_pedidos USING (activo = true);
-
--- Políticas VENTAS
-CREATE POLICY policy_ventas_admin ON ventas FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_ventas_socio ON ventas FOR SELECT TO socio USING (usuario_id = auth.uid());
-CREATE POLICY policy_ventas_socio_insert ON ventas FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid());
-CREATE POLICY policy_ventas_toma_pedidos ON ventas FOR SELECT TO toma_pedidos USING (false);
-
--- Políticas VENTAS_ITEMS
-CREATE POLICY policy_ventas_items_admin ON ventas_items FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_ventas_items_socio ON ventas_items FOR SELECT TO socio USING (venta_id IN (SELECT id FROM ventas WHERE usuario_id = auth.uid()));
-CREATE POLICY policy_ventas_items_socio_insert ON ventas_items FOR INSERT TO socio WITH CHECK (true);
-CREATE POLICY policy_ventas_items_toma_pedidos ON ventas_items FOR SELECT TO toma_pedidos USING (false);
-
--- Políticas GASTOS
-CREATE POLICY policy_gastos_admin ON gastos FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_gastos_socio_select ON gastos FOR SELECT TO socio USING (usuario_id = auth.uid());
-CREATE POLICY policy_gastos_socio_insert ON gastos FOR INSERT TO socio WITH CHECK (usuario_id = auth.uid());
-CREATE POLICY policy_gastos_socio_no_editar ON gastos FOR UPDATE TO socio USING (false);
-CREATE POLICY policy_gastos_socio_no_eliminar ON gastos FOR DELETE TO socio USING (false);
-CREATE POLICY policy_gastos_toma_pedidos ON gastos FOR SELECT TO toma_pedidos USING (false);
-
--- Políticas PEDIDOS
-CREATE POLICY policy_pedidos_admin ON pedidos FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_pedidos_socio ON pedidos FOR SELECT TO socio USING (usuario_id = auth.uid());
-CREATE POLICY policy_pedidos_toma_pedidos ON pedidos FOR SELECT TO toma_pedidos USING (true);
-CREATE POLICY policy_pedidos_toma_pedidos_insert ON pedidos FOR INSERT TO toma_pedidos WITH CHECK (true);
-
--- Políticas PEDIDOS_ITEMS
-CREATE POLICY policy_pedidos_items_admin ON pedidos_items FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_pedidos_items_socio ON pedidos_items FOR SELECT TO socio USING (pedido_id IN (SELECT id FROM pedidos WHERE usuario_id = auth.uid()));
-CREATE POLICY policy_pedidos_items_toma_pedidos ON pedidos_items FOR SELECT TO toma_pedidos USING (true);
-
--- Políticas MOVIMIENTOS_INVENTARIO
-CREATE POLICY policy_movimientos_admin ON movimientos_inventario FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_movimientos_lectura ON movimientos_inventario FOR SELECT TO socio, toma_pedidos USING (true);
-
--- Políticas CONTROL_CAJA
-CREATE POLICY policy_control_caja_admin ON control_caja FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_control_caja_select ON control_caja FOR SELECT TO socio, toma_pedidos USING (true);
-
--- Políticas AUDITORÍA
-CREATE POLICY policy_auditor_admin ON auditoria FOR ALL TO admin USING (true) WITH CHECK (true);
-CREATE POLICY policy_auditor_lectura ON auditoria FOR SELECT TO socio, toma_pedidos USING (false);
-
--- ============================================================
--- Índices para Performance
+-- Índices
 -- ============================================================
 CREATE INDEX idx_ventas_fecha ON ventas(fecha DESC);
 CREATE INDEX idx_ventas_usuario ON ventas(usuario_id);
 CREATE INDEX idx_productos_categoria ON productos(categoria);
-CREATE INDEX idx_productos_stock ON productos(stock);
 CREATE INDEX idx_gastos_fecha ON gastos(fecha);
 CREATE INDEX idx_pedidos_fecha ON pedidos(fecha DESC);
-CREATE INDEX idx_movimientos_producto ON movimientos_inventario(producto_id);
-CREATE INDEX idx_auditoria_fecha ON auditoria(fecha DESC);
-CREATE INDEX idx_ventas_items_producto ON ventas_items(producto_id);
-CREATE INDEX idx_pedidos_items_producto ON pedidos_items(producto_id);
